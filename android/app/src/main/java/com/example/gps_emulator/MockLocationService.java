@@ -62,11 +62,11 @@ public class MockLocationService extends Service {
         if (action == null) action = "";
         switch (action) {
             case ACTION_START:
-                currentLat      = intent.getDoubleExtra(EXTRA_LAT, 0.0);
-                currentLng      = intent.getDoubleExtra(EXTRA_LNG, 0.0);
-                currentSpeed    = intent.getFloatExtra(EXTRA_SPEED, 0.0f);
-                currentBearing  = intent.getFloatExtra(EXTRA_BEARING, 0.0f);
-                currentAccuracy = intent.getFloatExtra(EXTRA_ACCURACY, 3.0f);
+                currentLat       = intent.getDoubleExtra(EXTRA_LAT, 0.0);
+                currentLng       = intent.getDoubleExtra(EXTRA_LNG, 0.0);
+                currentSpeed     = intent.getFloatExtra(EXTRA_SPEED, 0.0f);
+                currentBearing   = intent.getFloatExtra(EXTRA_BEARING, 0.0f);
+                currentAccuracy  = intent.getFloatExtra(EXTRA_ACCURACY, 3.0f);
                 updateIntervalMs = intent.getLongExtra(EXTRA_INTERVAL, 1000);
                 startMockLocation();
                 break;
@@ -83,27 +83,44 @@ public class MockLocationService extends Service {
         return START_STICKY;
     }
 
+    // ✅ Remove first, then add fresh — prevents "already exists" error
+    private void setupTestProvider(String provider) {
+        try {
+            locationManager.removeTestProvider(provider);
+        } catch (Exception ignored) {}
+
+        try {
+            locationManager.addTestProvider(
+                provider,
+                false, false, false, false,
+                true, true, true,
+                android.location.provider.ProviderProperties.POWER_USAGE_LOW,
+                android.location.provider.ProviderProperties.ACCURACY_FINE
+            );
+            locationManager.setTestProviderEnabled(provider, true);
+            Log.d(TAG, "Provider ready: " + provider);
+        } catch (Exception e) {
+            Log.e(TAG, "Provider setup failed [" + provider + "]: " + e.getMessage());
+        }
+    }
+
     private void startMockLocation() {
         if (isRunning) return;
         isRunning = true;
-        startForeground(NOTIFICATION_ID, buildNotification("GPS Emulator Active", currentLat + ", " + currentLng));
-        try {
-            locationManager.addTestProvider(LocationManager.GPS_PROVIDER, false, false, false, false, true, true, true, 0, 5);
-            locationManager.setTestProviderEnabled(LocationManager.GPS_PROVIDER, true);
-        } catch (Exception e) {
-            Log.e(TAG, "GPS provider setup error: " + e.getMessage());
-        }
-        try {
-            locationManager.addTestProvider(LocationManager.NETWORK_PROVIDER, false, false, false, false, true, true, true, 0, 5);
-            locationManager.setTestProviderEnabled(LocationManager.NETWORK_PROVIDER, true);
-        } catch (Exception e) {
-            Log.w(TAG, "Network provider setup: " + e.getMessage());
-        }
+
+        startForeground(NOTIFICATION_ID,
+            buildNotification("GPS Emulator Active", currentLat + ", " + currentLng));
+
+        // ✅ Setup providers cleanly
+        setupTestProvider(LocationManager.GPS_PROVIDER);
+        setupTestProvider(LocationManager.NETWORK_PROVIDER);
+
         locationRunnable = new Runnable() {
             @Override public void run() {
                 if (!isRunning) return;
                 pushMockLocation(currentLat, currentLng, currentSpeed, currentBearing, currentAccuracy);
-                updateNotification("GPS Emulator Active", String.format("%.6f, %.6f", currentLat, currentLng));
+                updateNotification("GPS Emulator Active",
+                    String.format("%.6f, %.6f", currentLat, currentLng));
                 handler.postDelayed(this, updateIntervalMs);
             }
         };
@@ -111,7 +128,26 @@ public class MockLocationService extends Service {
     }
 
     private void pushMockLocation(double lat, double lng, float speed, float bearing, float accuracy) {
-        Location loc = new Location(LocationManager.GPS_PROVIDER);
+        try {
+            Location loc = buildLocation(LocationManager.GPS_PROVIDER, lat, lng, speed, bearing, accuracy);
+            locationManager.setTestProviderLocation(LocationManager.GPS_PROVIDER, loc);
+        } catch (Exception e) {
+            Log.e(TAG, "GPS push error: " + e.getMessage());
+            setupTestProvider(LocationManager.GPS_PROVIDER); // re-register if lost
+        }
+
+        try {
+            Location netLoc = buildLocation(LocationManager.NETWORK_PROVIDER, lat, lng, 0f, 0f, accuracy * 3);
+            locationManager.setTestProviderLocation(LocationManager.NETWORK_PROVIDER, netLoc);
+        } catch (Exception e) {
+            Log.w(TAG, "Network push: " + e.getMessage());
+            setupTestProvider(LocationManager.NETWORK_PROVIDER); // re-register if lost
+        }
+    }
+
+    private Location buildLocation(String provider, double lat, double lng,
+                                   float speed, float bearing, float accuracy) {
+        Location loc = new Location(provider);
         loc.setLatitude(lat);
         loc.setLongitude(lng);
         loc.setAltitude(50.0);
@@ -125,30 +161,24 @@ public class MockLocationService extends Service {
             loc.setSpeedAccuracyMetersPerSecond(0.5f);
             loc.setVerticalAccuracyMeters(1.0f);
         }
-        try { locationManager.setTestProviderLocation(LocationManager.GPS_PROVIDER, loc); }
-        catch (Exception e) { Log.e(TAG, "GPS push error: " + e.getMessage()); }
-
-        try {
-            Location netLoc = new Location(LocationManager.NETWORK_PROVIDER);
-            netLoc.setLatitude(lat); netLoc.setLongitude(lng); netLoc.setAltitude(50.0);
-            netLoc.setAccuracy(accuracy * 3); netLoc.setTime(System.currentTimeMillis());
-            netLoc.setElapsedRealtimeNanos(SystemClock.elapsedRealtimeNanos());
-            locationManager.setTestProviderLocation(LocationManager.NETWORK_PROVIDER, netLoc);
-        } catch (Exception e) { Log.w(TAG, "Network push: " + e.getMessage()); }
+        return loc;
     }
 
     private void stopMockLocation() {
         isRunning = false;
         if (locationRunnable != null) handler.removeCallbacks(locationRunnable);
-        try { locationManager.setTestProviderEnabled(LocationManager.GPS_PROVIDER, false); locationManager.removeTestProvider(LocationManager.GPS_PROVIDER); } catch (Exception ignored) {}
-        try { locationManager.setTestProviderEnabled(LocationManager.NETWORK_PROVIDER, false); locationManager.removeTestProvider(LocationManager.NETWORK_PROVIDER); } catch (Exception ignored) {}
+        for (String p : new String[]{LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER}) {
+            try { locationManager.setTestProviderEnabled(p, false); } catch (Exception ignored) {}
+            try { locationManager.removeTestProvider(p); } catch (Exception ignored) {}
+        }
         stopForeground(true);
         stopSelf();
     }
 
     private void createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            NotificationChannel ch = new NotificationChannel(CHANNEL_ID, "GPS Emulator", NotificationManager.IMPORTANCE_LOW);
+            NotificationChannel ch = new NotificationChannel(
+                CHANNEL_ID, "GPS Emulator", NotificationManager.IMPORTANCE_LOW);
             ch.setDescription("GPS Emulator mock location service");
             NotificationManager nm = getSystemService(NotificationManager.class);
             if (nm != null) nm.createNotificationChannel(ch);
@@ -157,7 +187,8 @@ public class MockLocationService extends Service {
 
     private Notification buildNotification(String title, String content) {
         Intent i = new Intent(this, MainActivity.class);
-        PendingIntent pi = PendingIntent.getActivity(this, 0, i, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        PendingIntent pi = PendingIntent.getActivity(this, 0, i,
+            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         return new NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(title).setContentText(content)
             .setSmallIcon(android.R.drawable.ic_menu_mylocation)
@@ -171,6 +202,5 @@ public class MockLocationService extends Service {
     }
 
     @Nullable @Override public IBinder onBind(Intent intent) { return null; }
-
     @Override public void onDestroy() { stopMockLocation(); super.onDestroy(); }
 }
